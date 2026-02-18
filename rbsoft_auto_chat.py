@@ -16,7 +16,7 @@ from requests import HTTPError
 # Inspired by your webhook script:
 # - base url from SMS_GATEWAY_URL
 # - api key from SMS_GATEWAY_API_KEY (Bearer)
-BASE_URL = os.getenv('SMS_GATEWAY_URL') or os.getenv('RBSOFT_BASE_URL') or 'https://exanewtech.com'
+BASE_URL = os.getenv('SMS_GATEWAY_URL') or os.getenv('RBSOFT_BASE_URL') or 'https://gate.exanewtech.com'
 BASE_URL = BASE_URL.rstrip('/')
 
 TOKEN = os.getenv('SMS_GATEWAY_API_KEY') or os.getenv('RBSOFT_TOKEN') or ''  # used as Bearer token
