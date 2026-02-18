@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+rbsoft_state.json
+.env
