@@ -13,7 +13,7 @@ import requests
 # CONFIG
 # =========================
 
-BASE_URL = "https://smsgateway.rbsoft.org"
+BASE_URL = "https://gate.exanewtech.com"
 TOKEN = os.getenv("RBSOFT_TOKEN", "")  # Bearer token from RBSoft dashboard
 
 STATE_FILE = os.getenv("STATE_FILE", "rbsoft_state.json")
