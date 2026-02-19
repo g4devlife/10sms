@@ -9,7 +9,7 @@ Adapté au vrai code source PHP de gate.exanewtech.com :
   Messages: GET /services/get-messages.php?key=...&status=Received
 
 Structure SIM retournée :
-  data.devices[].sims = { "0": "SIM #1 [+237612345678]", "1": "SIM #2 [...]" }
+  data.devices[].sims = { "0": "SIM #1 [+337612345678]", "1": "SIM #2 [...]" }
 """
 
 import os
