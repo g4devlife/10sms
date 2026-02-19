@@ -166,11 +166,20 @@ def load_state() -> Dict[str, Any]:
     return state
 
 def atomic_save(state: Dict[str, Any]) -> None:
-    fd, tmp = tempfile.mkstemp(prefix='rbsoft_', suffix='.json')
+    # Temp file in same dir as STATE_FILE to avoid cross-device rename (Render.com)
+    state_dir = os.path.dirname(os.path.abspath(STATE_FILE)) or "."
+    fd, tmp = tempfile.mkstemp(prefix="rbsoft_", suffix=".json", dir=state_dir)
     try:
-        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(state, f, ensure_ascii=False, indent=2)
         os.replace(tmp, STATE_FILE)
+    except Exception:
+        # Fallback: direct write if rename still fails
+        try:
+            with open(STATE_FILE, "w", encoding="utf-8") as f:
+                json.dump(state, f, ensure_ascii=False, indent=2)
+        except Exception as e2:
+            print(f"[WARN] atomic_save failed: {e2}", flush=True)
     finally:
         if os.path.exists(tmp):
             try: os.remove(tmp)
