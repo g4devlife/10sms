@@ -9,7 +9,7 @@ Adapté au vrai code source PHP de gate.exanewtech.com :
   Messages: GET /services/get-messages.php?key=...&status=Received
 
 Structure SIM retournée :
-  data.devices[].sims = { "0": "SIM #1 [+337612345678]", "1": "SIM #2 [...]" }
+  data.devices[].sims = { "0": "SIM #1 [+237612345678]", "1": "SIM #2 [...]" }
 """
 
 import os
@@ -73,43 +73,52 @@ def _base_params() -> dict:
     return {'key': API_KEY}
 
 def _headers() -> dict:
-    return {'Accept': 'application/json'}
+    return {"Accept": "application/json"}
+
+def _safe_json(r: requests.Response, context: str = "") -> dict:
+    """Parse JSON de manière sécurisée — retourne {} si la réponse est vide ou non-JSON."""
+    body = r.text.strip() if r.text else ""
+    if not body:
+        # Réponse vide : normal quand aucun message (ex: 204 No Content)
+        return {}
+    try:
+        return r.json()
+    except ValueError:
+        # Log uniquement si ce n'est pas une réponse HTML/vide attendue
+        snippet = body[:120].replace("\n", " ")
+        print(f"[WARN] JSON parse fail ({context}) status={r.status_code} body={snippet!r}", flush=True)
+        return {}
 
 def api_get(path: str, params: Optional[dict] = None) -> dict:
     p = {**_base_params(), **(params or {})}
-    r = requests.get(f'{BASE_URL}{path}', headers=_headers(), params=p, timeout=30)
+    r = requests.get(f"{BASE_URL}{path}", headers=_headers(), params=p, timeout=30)
     r.raise_for_status()
-    data = r.json()
-    # Le gateway renvoie toujours {"success": bool, "data": ..., "error": ...}
-    if isinstance(data, dict) and data.get('success') is False:
-        err = data.get('error', {})
-        code = err.get('code', 0) if isinstance(err, dict) else 0
-        msg  = err.get('message', str(err)) if isinstance(err, dict) else str(err)
-        raise RuntimeError(f'API error {code}: {msg}')
+    data = _safe_json(r, path)
+    if isinstance(data, dict) and data.get("success") is False:
+        err  = data.get("error", {})
+        code = err.get("code", 0) if isinstance(err, dict) else 0
+        msg  = err.get("message", str(err)) if isinstance(err, dict) else str(err)
+        raise RuntimeError(f"API error {code}: {msg}")
     return data
 
 def api_get_raw(path: str, params: Optional[dict] = None) -> dict:
-    """Comme api_get mais retourne le dict brut sans lever d'exception sur success=False."""
+    """Retourne le dict brut sans lever d'exception sur success=False."""
     p = {**_base_params(), **(params or {})}
-    r = requests.get(f'{BASE_URL}{path}', headers=_headers(), params=p, timeout=30)
+    r = requests.get(f"{BASE_URL}{path}", headers=_headers(), params=p, timeout=30)
     r.raise_for_status()
-    return r.json()
+    return _safe_json(r, path)
 
 def api_post(path: str, payload: Optional[dict] = None, params: Optional[dict] = None) -> dict:
-    """POST avec les paramètres en query string (le gateway accepte GET et POST)."""
     p = {**_base_params(), **(params or {})}
-    r = requests.post(f'{BASE_URL}{path}', headers=_headers(), params=p,
+    r = requests.post(f"{BASE_URL}{path}", headers=_headers(), params=p,
                       data=payload or {}, timeout=30)
     r.raise_for_status()
-    try:
-        data = r.json()
-    except Exception:
-        return {}
-    if isinstance(data, dict) and data.get('success') is False:
-        err = data.get('error', {})
-        code = err.get('code', 0) if isinstance(err, dict) else 0
-        msg  = err.get('message', str(err)) if isinstance(err, dict) else str(err)
-        raise RuntimeError(f'API error {code}: {msg}')
+    data = _safe_json(r, path)
+    if isinstance(data, dict) and data.get("success") is False:
+        err  = data.get("error", {})
+        code = err.get("code", 0) if isinstance(err, dict) else 0
+        msg  = err.get("message", str(err)) if isinstance(err, dict) else str(err)
+        raise RuntimeError(f"API error {code}: {msg}")
     return data
 
 # =========================
@@ -265,12 +274,12 @@ def send_sms(state: Dict[str, Any], spec: str, to_number: str, message: str) -> 
     p = {**_base_params(), **params}
     r = requests.get(f'{BASE_URL}{EP_SEND}', headers=_headers(), params=p, timeout=30)
     r.raise_for_status()
-    data = r.json()
-    if isinstance(data, dict) and data.get('success') is False:
-        err = data.get('error', {})
-        msg = err.get('message', str(err)) if isinstance(err, dict) else str(err)
-        raise RuntimeError(f'send_sms error: {msg}')
-    print(f'  [SMS] {spec} → {to_number} | {message[:40]}…', flush=True)
+    data = _safe_json(r, EP_SEND)
+    if isinstance(data, dict) and data.get("success") is False:
+        err = data.get("error", {})
+        msg = err.get("message", str(err)) if isinstance(err, dict) else str(err)
+        raise RuntimeError(f"send_sms error: {msg}")
+    print(f"  [SMS] {spec} -> {to_number} | {message[:40]}", flush=True)
 
 # =========================
 # Fetch messages reçus
@@ -461,6 +470,7 @@ def adaptive_pairing(state: Dict[str, Any], sims_map: Dict[str, str]) -> dict:
     for c in state.get('conversations', {}).values():
         if c.get('status') == 'active':
             busy.update([c['a_number'], c['b_number']])
+    print(f"  [PAIR] numbers={numbers} busy={sorted(busy)} pairs={sorted(pairs)}", flush=True)
 
     available = [n for n in numbers if n not in busy]
     waiting   = state.get('waiting_number')
@@ -572,24 +582,43 @@ def process_inbound(state: Dict[str, Any], msg: dict) -> Optional[dict]:
 # =========================
 def run():
     if not API_KEY:
-        raise SystemExit('❌ Variable SMS_GATEWAY_API_KEY (ou RBSOFT_TOKEN) manquante.')
+        raise SystemExit("Variable SMS_GATEWAY_API_KEY (ou RBSOFT_TOKEN) manquante.")
 
-    print('AutoChat ExaGate — démarrage', flush=True)
-    print(f'BASE_URL = {BASE_URL}', flush=True)
+    print("AutoChat ExaGate — demarrage", flush=True)
+    print(f"BASE_URL = {BASE_URL}", flush=True)
 
     # Vérification de connectivité
     try:
-        r = requests.get(f'{BASE_URL}{EP_DEVICES}', headers=_headers(),
+        r = requests.get(f"{BASE_URL}{EP_DEVICES}", headers=_headers(),
                          params=_base_params(), timeout=10)
-        print(f'[INIT] Status /services/get-devices.php → {r.status_code}', flush=True)
+        print(f"[INIT] Status /services/get-devices.php -> {r.status_code}", flush=True)
+        body_preview = r.text[:200].replace("\n", " ")
+        print(f"[INIT] Body preview: {body_preview!r}", flush=True)
     except Exception as e:
-        print(f'[INIT] Erreur connexion : {e}', flush=True)
+        print(f"[INIT] Erreur connexion : {e}", flush=True)
         raise SystemExit(1)
 
     # ── Chargement état ──────────────────────────────────────────────────────
     with _lock:
         state = load_state()
-        atomic_save(state)
+
+    # RESET_STATE=1 : efface les conversations et redémarre la découverte
+    if os.getenv("RESET_STATE", "0") == "1":
+        print("[INIT] RESET_STATE=1 : nettoyage de l'état...", flush=True)
+        state["conversations"]  = {}
+        state["dedupe_msg_ids"] = {}
+        state["waiting_number"] = None
+        state["rate"]           = {"global": [], "per_sim": {}}
+        state["discovery"]      = _default_state()["discovery"]
+        state["known_sims"]     = {}
+
+    # Nettoyer les conversations "active" dont les numéros ne sont plus dans known_sims
+    # (peut arriver après un redémarrage avec des SIMs changés)
+    active_before = sum(1 for c in state.get("conversations", {}).values() if c.get("status") == "active")
+    if active_before > 0:
+        print(f"[INIT] {active_before} conversations actives chargées depuis l'état.", flush=True)
+
+    atomic_save(state)
 
     # ── PHASE 1 : DÉCOUVERTE ─────────────────────────────────────────────────
     if not state['discovery']['done']:
