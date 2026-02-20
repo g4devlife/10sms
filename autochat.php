@@ -231,8 +231,8 @@ function run(): void {
 
         // Executer une conversation complete avec chaque target
         foreach ($targets as $target) {
-            $pair_key = implode('|', array_unique([$sender, $target]));
-            sort($arr = explode('|', $pair_key));
+            $arr = [$sender, $target];
+            sort($arr);
             $pair_key = implode('|', $arr);
 
             log_("[RR] Paire: $sender <-> $target");
