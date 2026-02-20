@@ -1,10 +1,18 @@
 services:
   - type: worker
-    name: rbsoft-autochat
-    env: python
-    plan: starter
-    buildCommand: pip install -r requirements.txt
-    startCommand: python rbsoft_auto_chat.py
+    name: autochat-php
+    env: docker
+    dockerfilePath: ./Dockerfile
+    plan: free
+    autoDeploy: true
     envVars:
-      - key: RBSOFT_TOKEN
+      - key: SMS_GATEWAY_API_KEY
         sync: false
+      - key: SMS_GATEWAY_URL
+        value: https://gate.exanewtech.com
+      - key: MAX_TURNS
+        value: "10"
+      - key: POLL_INTERVAL_S
+        value: "5"
+      - key: RR_TICK_S
+        value: "20"
