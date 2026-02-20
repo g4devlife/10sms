@@ -150,8 +150,12 @@ _lock = threading.Lock()
 
 def _default_state() -> Dict[str, Any]:
     return {
-        'conversations':  {},
-        'waiting_number': None,
+        # Paires de conversation: {"numA|numB": {sender, receiver, turn, status}}
+        'pairs':          {},
+        # Routage des réponses: {"numB": "numA"} = quand numB écrit, répondre en tant que numA
+        'reply_routing':  {},
+        # Round-robin: quel SIM est l'émetteur courant
+        'round_robin':    {'sender_idx': 0, 'cycle': 0},
         'known_sims':     {},          # {number: "device_id|slot"}
         'dedupe_msg_ids': {},
         'rate':           {'global': [], 'per_sim': {}},
@@ -424,158 +428,188 @@ def run_discovery_phase(state: Dict[str, Any]) -> Dict[str, str]:
     return dict(disc['confirmed_sims'])
 
 # =========================
-# PHASE 2 : CONVERSATIONS
+# PHASE 2 : ROUND-ROBIN BROADCAST
 # =========================
-def build_text(conv_id: str, turn: int) -> str:
-    base = TEMPLATES[min(max(turn - 1, 0), len(TEMPLATES) - 1)]
-    return f'{CONVERSATION_TAG} id={conv_id} t={turn}] {base}'
+# Logique :
+#   - SIM[0] envoie à tous les autres (SIM[1], SIM[2], ...)
+#   - Chaque destinataire répond automatiquement
+#   - Quand toutes les paires de SIM[0] sont terminées → SIM[1] envoie à tous
+#   - Cycle infini (ou arrêt après MAX_TURNS échanges par paire)
+#
+# Messages : UNIQUEMENT les templates, aucun tag interne
 
-def conv_key(a: str, b: str) -> str:
-    return '|'.join(sorted([a, b]))
+def pair_key(a: str, b: str) -> str:
+    """Clé de paire directionnelle: émetteur|destinataire."""
+    return f"{a}|{b}"
 
-def build_existing_pairs(state: Dict[str, Any]) -> Set[str]:
-    return {conv_key(c['a_number'], c['b_number'])
-            for c in state.get('conversations', {}).values()}
+def pick_template(turn: int) -> str:
+    """Retourne le template correspondant au tour (cyclique)."""
+    return TEMPLATES[(turn - 1) % len(TEMPLATES)]
 
-def start_one_conversation(state: Dict[str, Any], a_num: str, b_num: str,
-                           sims_map: Dict[str, str]) -> Optional[str]:
-    a_spec = sims_map.get(a_num)
-    b_spec = sims_map.get(b_num)
-    if not a_spec or not b_spec:
-        return None
+def get_sender_number(state: Dict[str, Any], sims_list: List[str]) -> str:
+    """Retourne le numéro de l'émetteur courant selon le round-robin."""
+    rr  = state.setdefault("round_robin", {"sender_idx": 0, "cycle": 0})
+    idx = rr.get("sender_idx", 0) % len(sims_list)
+    return sims_list[idx]
 
-    cid = uuid.uuid4().hex[:10]
-    state['conversations'][cid] = {
-        'id':          cid,
-        'a_number':    a_num,
-        'b_number':    b_num,
-        'a_spec':      a_spec,
-        'b_spec':      b_spec,
-        'turn':        0,
-        'max_turns':   MAX_TURNS,
-        'status':      'active',
-        'last_sender': None,
-        'created_at':  time.time(),
-    }
-    if can_send(state, a_spec):
-        send_sms(state, a_spec, b_num, build_text(cid, 1))
-        state['conversations'][cid]['turn']        = 1
-        state['conversations'][cid]['last_sender'] = a_num
-    return cid
+def all_pairs_done(state: Dict[str, Any], sender: str, sims_list: List[str]) -> bool:
+    """Vérifie si toutes les paires de l'émetteur courant sont terminées."""
+    targets = [n for n in sims_list if n != sender]
+    if not targets:
+        return True
+    pairs = state.get("pairs", {})
+    for t in targets:
+        pk = pair_key(sender, t)
+        p  = pairs.get(pk, {})
+        if p.get("status") != "done":
+            return False
+    return True
 
-def adaptive_pairing(state: Dict[str, Any], sims_map: Dict[str, str]) -> dict:
-    numbers = sorted(sims_map.keys())
-    pairs   = build_existing_pairs(state)
-    busy    = set()
-    for c in state.get('conversations', {}).values():
-        if c.get('status') == 'active':
-            busy.update([c['a_number'], c['b_number']])
-    print(f"  [PAIR] numbers={numbers} busy={sorted(busy)} pairs={sorted(pairs)}", flush=True)
+def advance_round_robin(state: Dict[str, Any], sims_list: List[str]) -> str:
+    """Passe au prochain émetteur, retourne le nouveau numéro."""
+    rr  = state.setdefault("round_robin", {"sender_idx": 0, "cycle": 0})
+    rr["sender_idx"] = (rr.get("sender_idx", 0) + 1) % len(sims_list)
+    if rr["sender_idx"] == 0:
+        rr["cycle"] = rr.get("cycle", 0) + 1
+        # Réinitialiser toutes les paires pour le nouveau cycle
+        print(f"[RR] Cycle {rr['cycle']} — réinitialisation des paires", flush=True)
+        state["pairs"] = {}
+        state["reply_routing"] = {}
+    new_sender = sims_list[rr["sender_idx"]]
+    print(f"[RR] Nouvel émetteur → {new_sender} (idx={rr['sender_idx']})", flush=True)
+    return new_sender
 
-    available = [n for n in numbers if n not in busy]
-    waiting   = state.get('waiting_number')
-    if waiting and waiting in sims_map and waiting not in busy and waiting not in available:
-        available.insert(0, waiting)
-        state['waiting_number'] = None
-
-    random.shuffle(available)
-    created = 0; created_ids = []; skipped = 0; i = 0
-
-    while i + 1 < len(available):
-        a, b = available[i], available[i + 1]
-        i += 2
-        key = conv_key(a, b)
-        if key in pairs:
-            skipped += 1; continue
-        cid = start_one_conversation(state, a, b, sims_map)
-        if cid:
-            created += 1; created_ids.append(cid); pairs.add(key)
-        else:
-            skipped += 1
-
-    if i < len(available):
-        state['waiting_number'] = available[i]
-
-    return {'created': created, 'created_ids': created_ids,
-            'skipped': skipped, 'waiting': state['waiting_number']}
-
-def find_conv(state: Dict[str, Any], from_n: str, device_id: int, sim_slot: int) -> Optional[str]:
+def tick_round_robin(state: Dict[str, Any], sims_map: Dict[str, str]) -> dict:
     """
-    Cherche la conversation par (from_number, device_id+slot).
-    Le device_id+slot nous dit QUI a reçu le message (le destinataire dans la conversation).
+    Lance les envois pour l'émetteur courant vers tous les autres.
+    Avance au suivant si toutes ses paires sont terminées.
     """
-    for cid, c in state.get('conversations', {}).items():
-        # Reconstituer les specs depuis la map connue
-        sims = state.get('known_sims', {})
-        a_spec = sims.get(c['a_number'], '')
-        b_spec = sims.get(c['b_number'], '')
+    if len(sims_map) < 2:
+        return {"skipped": "not_enough_sims"}
 
-        receiver_spec = f'{device_id}|{sim_slot}'
+    sims_list = sorted(sims_map.keys())
+    sender    = get_sender_number(state, sims_list)
+    sender_spec = sims_map[sender]
+    pairs     = state.setdefault("pairs", {})
+    routing   = state.setdefault("reply_routing", {})
 
-        if c['a_number'] == from_n and b_spec == receiver_spec:
-            return cid
-        if c['b_number'] == from_n and a_spec == receiver_spec:
-            return cid
-    return None
+    # Vérifier si l'émetteur courant a fini toutes ses paires
+    if all_pairs_done(state, sender, sims_list):
+        print(f"[RR] {sender} a terminé toutes ses paires.", flush=True)
+        sender = advance_round_robin(state, sims_list)
+        sender_spec = sims_map[sender]
+
+    targets  = [n for n in sims_list if n != sender]
+    sent     = 0
+    skipped  = 0
+
+    for target in targets:
+        pk = pair_key(sender, target)
+        p  = pairs.get(pk)
+
+        if p is None:
+            # Nouvelle paire : envoi du 1er message
+            if not can_send(state, sender_spec):
+                skipped += 1
+                continue
+            msg_text = pick_template(1)
+            try:
+                send_sms(state, sender_spec, target, msg_text)
+                pairs[pk] = {
+                    "sender":   sender,
+                    "receiver": target,
+                    "turn":     1,
+                    "status":   "active",
+                    "last_sent_at": time.time(),
+                }
+                # Enregistrer le routage : quand target répond → répondre via sender
+                routing[target] = sender
+                sent += 1
+                time.sleep(random.uniform(1.0, 3.0))
+            except Exception as e:
+                print(f"  [ERR] send {sender}→{target}: {e}", flush=True)
+                skipped += 1
+
+        elif p.get("status") == "done":
+            skipped += 1  # déjà terminée
+
+        # status == "active" → en attente de réponse, ne rien faire
+
+    return {"sender": sender, "sent": sent, "skipped": skipped,
+            "targets": targets, "active_pairs": sum(
+                1 for p in pairs.values() if p.get("status") == "active")}
 
 def process_inbound(state: Dict[str, Any], msg: dict) -> Optional[dict]:
+    """
+    Traite un message reçu.
+    Matching simplifié : basé sur reply_routing[from_number] → pas besoin de deviceID/simSlot.
+    """
     mid     = msg_id_from(msg)
-    from_n  = msg.get('number', '')          # expéditeur
-    content = msg.get('message', '')
-    dev_id  = msg.get('deviceID')
-    slot    = msg.get('simSlot')
+    from_n  = (msg.get("number") or "").strip()
+    content = (msg.get("message") or "").strip()
 
     if not mid or not from_n:
         return None
 
-    dedupe = state.setdefault('dedupe_msg_ids', {})
+    dedupe = state.setdefault("dedupe_msg_ids", {})
     if mid in dedupe:
-        return {'ignored': 'duplicate', 'id': mid}
+        return {"ignored": "duplicate", "id": mid}
     dedupe[mid] = time.time()
 
-    # Ignorer nos propres messages internes
-    if DISCOVERY_TAG in content or CONVERSATION_TAG in content:
-        return {'ignored': 'internal', 'id': mid}
+    # Ignorer les SMS de découverte
+    if DISCOVERY_TAG in content:
+        return {"ignored": "discovery_msg", "id": mid}
 
-    if dev_id is None or slot is None:
-        return {'ignored': 'no_device_info', 'id': mid}
+    sims_map = state.get("known_sims", {})
 
-    cid = find_conv(state, from_n, int(dev_id), int(slot))
-    if not cid:
-        return {'ignored': 'no_match', 'from': from_n, 'id': mid}
+    # from_n doit être un de nos SIMs connus
+    if from_n not in sims_map:
+        return {"ignored": "unknown_sender", "from": from_n, "id": mid}
 
-    conv = state['conversations'][cid]
-    if conv['status'] != 'active':
-        return {'ignored': 'inactive', 'conv': cid}
-    if int(conv['turn']) >= int(conv['max_turns']):
-        conv['status'] = 'done'
-        return {'stopped': 'max_turns', 'conv': cid}
+    # Trouver l'émetteur original via le routing
+    routing    = state.get("reply_routing", {})
+    sender_num = routing.get(from_n)  # numA (celui qui avait envoyé en premier)
 
-    # Le répondeur = celui dont la SIM a reçu le message
-    receiver_spec = f'{dev_id}|{slot}'
-    sims = state.get('known_sims', {})
-    # Trouver le numéro du répondeur
-    responder_num = None
-    for num, spec in sims.items():
-        if spec == receiver_spec:
-            responder_num = num
-            break
+    if not sender_num:
+        return {"ignored": "no_routing", "from": from_n, "id": mid}
 
-    if not responder_num or not can_send(state, receiver_spec):
-        return {'skipped': 'rate_limited_or_unknown', 'conv': cid}
+    sender_spec = sims_map.get(sender_num)
+    if not sender_spec:
+        return {"ignored": "sender_spec_missing", "from": from_n, "id": mid}
 
-    next_turn  = int(conv['turn']) + 1
-    reply_text = build_text(cid, next_turn)
+    # Trouver la paire
+    pk   = pair_key(sender_num, from_n)
+    pair = state.get("pairs", {}).get(pk)
+
+    if not pair:
+        return {"ignored": "no_pair", "pk": pk, "id": mid}
+
+    if pair.get("status") == "done":
+        return {"ignored": "pair_done", "pk": pk, "id": mid}
+
+    turn = int(pair.get("turn", 1))
+    if turn >= MAX_TURNS:
+        pair["status"] = "done"
+        return {"done": True, "pk": pk, "turn": turn}
+
+    # Rate limit
+    if not can_send(state, sender_spec):
+        return {"skipped": "rate_limited", "pk": pk}
+
+    next_turn = turn + 1
+    reply_txt = pick_template(next_turn)
 
     time.sleep(random.randint(REPLY_DELAY_MIN_S, REPLY_DELAY_MAX_S))
-    send_sms(state, receiver_spec, from_n, reply_text)
-
-    conv['turn']        = next_turn
-    conv['last_sender'] = responder_num
-    if int(conv['turn']) >= int(conv['max_turns']):
-        conv['status'] = 'done'
-
-    return {'replied': True, 'conv': cid, 'turn': conv['turn'], 'id': mid}
+    try:
+        send_sms(state, sender_spec, from_n, reply_txt)
+        pair["turn"]         = next_turn
+        pair["last_sent_at"] = time.time()
+        if next_turn >= MAX_TURNS:
+            pair["status"] = "done"
+            print(f"  [DONE] Paire {pk} terminée ({next_turn} tours)", flush=True)
+        return {"replied": True, "pk": pk, "turn": next_turn, "id": mid}
+    except Exception as e:
+        return {"error": str(e), "pk": pk, "id": mid}
 
 # =========================
 # MAIN
@@ -584,16 +618,16 @@ def run():
     if not API_KEY:
         raise SystemExit("Variable SMS_GATEWAY_API_KEY (ou RBSOFT_TOKEN) manquante.")
 
-    print("AutoChat ExaGate — demarrage", flush=True)
+    print("AutoChat ExaGate — Round-Robin Broadcast", flush=True)
     print(f"BASE_URL = {BASE_URL}", flush=True)
 
     # Vérification de connectivité
     try:
         r = requests.get(f"{BASE_URL}{EP_DEVICES}", headers=_headers(),
                          params=_base_params(), timeout=10)
-        print(f"[INIT] Status /services/get-devices.php -> {r.status_code}", flush=True)
+        print(f"[INIT] /services/get-devices.php -> {r.status_code}", flush=True)
         body_preview = r.text[:200].replace("\n", " ")
-        print(f"[INIT] Body preview: {body_preview!r}", flush=True)
+        print(f"[INIT] Body: {body_preview!r}", flush=True)
     except Exception as e:
         print(f"[INIT] Erreur connexion : {e}", flush=True)
         raise SystemExit(1)
@@ -602,91 +636,96 @@ def run():
     with _lock:
         state = load_state()
 
-    # RESET_STATE=1 : efface les conversations et redémarre la découverte
+    # RESET_STATE=1 : repart de zéro
     if os.getenv("RESET_STATE", "0") == "1":
-        print("[INIT] RESET_STATE=1 : nettoyage de l'état...", flush=True)
-        state["conversations"]  = {}
-        state["dedupe_msg_ids"] = {}
-        state["waiting_number"] = None
-        state["rate"]           = {"global": [], "per_sim": {}}
-        state["discovery"]      = _default_state()["discovery"]
-        state["known_sims"]     = {}
-
-    # Nettoyer les conversations "active" dont les numéros ne sont plus dans known_sims
-    # (peut arriver après un redémarrage avec des SIMs changés)
-    active_before = sum(1 for c in state.get("conversations", {}).values() if c.get("status") == "active")
-    if active_before > 0:
-        print(f"[INIT] {active_before} conversations actives chargées depuis l'état.", flush=True)
+        print("[INIT] RESET_STATE=1 — nettoyage complet", flush=True)
+        state = _default_state()
 
     atomic_save(state)
 
     # ── PHASE 1 : DÉCOUVERTE ─────────────────────────────────────────────────
-    if not state['discovery']['done']:
-        print('\n══ PHASE 1 : DÉCOUVERTE DES SIMs ══', flush=True)
+    if not state["discovery"]["done"]:
+        print("\n══ PHASE 1 : DÉCOUVERTE DES SIMs ══", flush=True)
         with _lock:
             state = load_state()
         try:
             confirmed_sims = run_discovery_phase(state)
         except Exception as e:
-            print(f'[DISCOVERY] Échec : {e}', flush=True)
+            print(f"[DISCOVERY] Échec : {e}", flush=True)
             raise SystemExit(1)
         with _lock:
             state = load_state()
-        state['known_sims'] = confirmed_sims
+        state["known_sims"] = confirmed_sims
         atomic_save(state)
-        print(f'\n✅ {len(confirmed_sims)} SIMs confirmés :', flush=True)
+        print(f"\n✅ {len(confirmed_sims)} SIMs confirmés :", flush=True)
         for num, spec in confirmed_sims.items():
-            print(f'   {num} → {spec}', flush=True)
+            print(f"   {num} -> {spec}", flush=True)
     else:
-        confirmed_sims = {k: v for k, v in state['discovery']['confirmed_sims'].items()}
-        print('[DISCOVERY] Déjà effectuée.', flush=True)
+        confirmed_sims = {k: v for k, v in state["discovery"]["confirmed_sims"].items()}
+        print("[DISCOVERY] Déjà effectuée.", flush=True)
         for num, spec in confirmed_sims.items():
-            print(f'   {num} → {spec}', flush=True)
+            print(f"   {num} -> {spec}", flush=True)
 
-    print('\nDémarrage des conversations dans 3s…', flush=True)
+    if len(confirmed_sims) < 2:
+        raise SystemExit(f"Seulement {len(confirmed_sims)} SIM(s) — minimum 2 requis.")
+
+    print("\nDémarrage dans 3s…", flush=True)
     time.sleep(3)
 
-    # ── PHASE 2 : CONVERSATIONS ───────────────────────────────────────────────
-    print('\n══ PHASE 2 : CONVERSATIONS ══\n', flush=True)
+    # ── PHASE 2 : ROUND-ROBIN BROADCAST ──────────────────────────────────────
+    print("\n══ PHASE 2 : ROUND-ROBIN BROADCAST ══\n", flush=True)
+
+    last_sim_refresh = 0.0
+    rr_tick_interval = int(os.getenv("RR_TICK_INTERVAL_S", "15"))  # fréquence des envois initiaux
 
     while True:
         try:
             now = time.time()
 
-            with _lock:
-                state = load_state()
-            last_refresh = float(state.get('meta', {}).get('last_sim_refresh', 0) or 0)
-
-            if (now - last_refresh) >= SIM_REFRESH_INTERVAL_S:
+            # Rafraîchissement périodique des SIMs
+            if (now - last_sim_refresh) >= SIM_REFRESH_INTERVAL_S:
                 with _lock:
                     state = load_state()
-                fresh = fetch_sims(state)
-                # Conserver uniquement les SIMs connus
+                fresh    = fetch_sims(state)
                 sims_map = {n: s for n, s in fresh.items() if n in confirmed_sims}
-                state['known_sims'] = sims_map
-                state.setdefault('meta', {})['last_sim_refresh'] = now
-                pairing = adaptive_pairing(state, sims_map)
+                state["known_sims"] = sims_map
+                state.setdefault("meta", {})["last_sim_refresh"] = now
                 atomic_save(state)
-                print(f'[SIMS] {len(sims_map)} actifs | Pairing={pairing}', flush=True)
+                last_sim_refresh = now
+                print(f"[SIMS] {len(sims_map)} actifs: {sorted(sims_map.keys())}", flush=True)
+            else:
+                with _lock:
+                    state = load_state()
+                sims_map = state.get("known_sims", {}) or confirmed_sims
 
-            with _lock:
-                state = load_state()
-            msgs        = fetch_received_messages(state)
-            msgs_sorted = sorted(msgs, key=lambda x: int(x.get('id') or x.get('ID') or 0))
-            updates     = []
+            if not sims_map:
+                print("[WARN] Aucun SIM actif, attente...", flush=True)
+                time.sleep(POLL_INTERVAL_S * 2)
+                continue
+
+            # ── Traitement des messages entrants ──────────────────────────
+            msgs = fetch_received_messages(state)
+            msgs_sorted = sorted(msgs, key=lambda x: int(x.get("id") or x.get("ID") or 0))
+            updates = []
             for m in msgs_sorted:
                 out = process_inbound(state, m)
                 if out:
                     updates.append(out)
-            atomic_save(state)
             if updates:
-                print('Updates:', updates, flush=True)
+                print(f"[INBOUND] {updates}", flush=True)
+
+            # ── Tick round-robin (lancer les envois initiaux) ─────────────
+            rr_result = tick_round_robin(state, sims_map)
+            if rr_result.get("sent", 0) > 0 or rr_result.get("active_pairs", 0) > 0:
+                print(f"[RR] {rr_result}", flush=True)
+
+            atomic_save(state)
 
         except Exception as e:
-            print(f'Error: {repr(e)}', flush=True)
+            print(f"Error: {repr(e)}", flush=True)
 
         time.sleep(POLL_INTERVAL_S)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     run()
