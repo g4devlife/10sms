@@ -1,3 +1,4 @@
+
 import os, re, json, time, random, tempfile
 from typing import Dict, Any, List, Optional
 import requests
@@ -10,7 +11,7 @@ MAX_TURNS            = int(os.getenv("MAX_TURNS",             "10"))
 POLL_INTERVAL_S      = int(os.getenv("POLL_INTERVAL_S",       "5"))
 SIM_REFRESH_S        = int(os.getenv("SIM_REFRESH_INTERVAL_S","60"))
 REPLY_DELAY_MIN_S    = int(os.getenv("REPLY_DELAY_MIN_S",     "3"))
-REPLY_DELAY_MAX_S    = int(os.getenv("REPLY_DELAY_MAX_S",     "8"))
+REPLY_DELAY_MAX_S    = int(os.getenv("REPLY_DELAY_MAX_S",     "5"))
 GLOBAL_SEND_PER_MIN  = int(os.getenv("GLOBAL_SEND_PER_MIN",  "60"))
 PER_SIM_SEND_PER_MIN = int(os.getenv("PER_SIM_SEND_PER_MIN", "20"))
 RR_TICK_S            = int(os.getenv("RR_TICK_S",             "20"))
@@ -220,6 +221,11 @@ def rr_tick(state):
                     "turn": 1, "status": "active", "at": time.time()
                 }
                 state.setdefault("routing", {})[target] = sender
+                # Synchro convs (cle symetrique) pour process()
+                cpk = "|".join(sorted([sender, target]))
+                state.setdefault("convs", {})[cpk] = {
+                    "turn": 1, "status": "active", "at": time.time()
+                }
                 sent += 1
                 time.sleep(random.uniform(1.5, 3.0))
             except Exception as e:
@@ -238,58 +244,103 @@ def rr_tick(state):
 
 # ─── INBOUND ────────────────────────────────────────────────────────────────────
 def process(state, msg):
+    """
+    Logique simplifiee basee sur deviceID+simSlot :
+      - from_n    = numero qui nous a envoye le message
+      - receiver  = notre SIM qui a recu (identifie via deviceID+simSlot)
+      - On repond DEPUIS receiver VERS from_n
+    Fonctionne quel que soit le sens de la conversation.
+    """
     mid    = msg_id(msg)
     from_n = (msg.get("number") or "").strip()
-    body   = (msg.get("message") or "").strip()
+    dev_id = msg.get("deviceID")
+    slot   = msg.get("simSlot")
+
     if not mid or not from_n:
         return None
 
+    # Deduplication
     seen = state.setdefault("seen", {})
     if mid in seen:
         return None
     seen[mid] = time.time()
 
-    sims    = state.get("sims", {})
-    routing = state.get("routing", {})
+    sims = state.get("sims", {})
 
+    # L expediteur doit etre un de nos SIMs (conversation inter-SIM uniquement)
     if from_n not in sims:
-        return {"skip": "unknown", "from": from_n}
+        return None  # message externe, ignorer silencieusement
 
-    sender_num = routing.get(from_n)
-    if not sender_num:
-        return {"skip": "no_routing", "from": from_n}
+    # Identifier quel SIM a recu via deviceID+simSlot
+    receiver_spec = None
+    receiver_num  = None
+    if dev_id is not None and slot is not None:
+        spec_candidate = f"{dev_id}|{slot}"
+        for num, spec in sims.items():
+            if spec == spec_candidate:
+                receiver_spec = spec
+                receiver_num  = num
+                break
 
-    sender_spec = sims.get(sender_num)
-    if not sender_spec:
-        return {"skip": "no_spec"}
+    # Fallback si deviceID/simSlot absent : chercher via routing ou pairs
+    if not receiver_spec:
+        routing = state.get("routing", {})
+        sender_via_routing = routing.get(from_n)
+        if sender_via_routing and sender_via_routing in sims:
+            receiver_num  = sender_via_routing
+            receiver_spec = sims[sender_via_routing]
 
-    pk   = f"{sender_num}|{from_n}"
-    pair = state.get("pairs", {}).get(pk)
-    if not pair:
-        return {"skip": "no_pair", "pk": pk}
-    if pair.get("status") == "done":
-        return {"skip": "done", "pk": pk}
+    if not receiver_spec or not receiver_num:
+        return {"skip": "cant_identify_receiver", "from": from_n,
+                "deviceID": dev_id, "simSlot": slot}
 
-    turn = int(pair.get("turn", 1))
+    # Cle de paire symetrique : toujours trie pour eviter duplicates
+    pk   = "|".join(sorted([from_n, receiver_num]))
+    convs = state.setdefault("convs", {})
+    conv  = convs.get(pk)
+
+    if conv is None:
+        # Nouvelle conversation non initiee par rr_tick (message entrant spontane)
+        conv = {"turn": 0, "status": "active"}
+
+    if conv.get("status") == "done":
+        return {"skip": "conv_done", "pk": pk}
+
+    turn = int(conv.get("turn", 0))
     if turn >= MAX_TURNS:
-        pair["status"] = "done"
-        print(f"  [DONE] {pk}", flush=True)
+        conv["status"] = "done"
+        convs[pk] = conv
+        print(f"  [DONE] {pk} ({turn} tours)", flush=True)
         return {"done": pk}
 
-    if not can_send(state, sender_spec):
+    if not can_send(state, receiver_spec):
         return {"skip": "rate", "pk": pk}
 
     next_turn = turn + 1
     reply     = tpl(next_turn)
-    time.sleep(random.randint(REPLY_DELAY_MIN_S, REPLY_DELAY_MAX_S))
+
+    # Delai humain avant reponse
+    delay = random.randint(REPLY_DELAY_MIN_S, REPLY_DELAY_MAX_S)
+    print(f"  [WAIT {delay}s] {receiver_num} -> {from_n}", flush=True)
+    time.sleep(delay)
+
     try:
-        send_sms(sender_spec, from_n, reply)
-        pair["turn"] = next_turn
-        pair["at"]   = time.time()
+        send_sms(receiver_spec, from_n, reply)
+        conv["turn"]   = next_turn
+        conv["at"]     = time.time()
         if next_turn >= MAX_TURNS:
-            pair["status"] = "done"
-            print(f"  [DONE] {pk}", flush=True)
-        return {"ok": pk, "turn": next_turn}
+            conv["status"] = "done"
+            print(f"  [DONE] {pk} ({next_turn} tours)", flush=True)
+        convs[pk] = conv
+        # Mettre a jour aussi la paire rr si elle existe
+        pairs = state.get("pairs", {})
+        for ppk in [f"{from_n}|{receiver_num}", f"{receiver_num}|{from_n}"]:
+            if ppk in pairs and pairs[ppk].get("status") == "active":
+                pairs[ppk]["turn"] = next_turn
+                if next_turn >= MAX_TURNS:
+                    pairs[ppk]["status"] = "done"
+        return {"replied": pk, "turn": next_turn,
+                "from": from_n, "via": receiver_num}
     except Exception as e:
         return {"err": str(e), "pk": pk}
 
