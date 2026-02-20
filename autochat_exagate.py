@@ -1,4 +1,3 @@
-
 import os, re, json, time, random, tempfile
 from typing import Dict, Any, List, Optional
 import requests
@@ -57,17 +56,28 @@ def api_get(path, params=None):
     return _json(r, path)
 
 # ─── SIMs ───────────────────────────────────────────────────────────────────────
-_NUM_RE = re.compile(r"\[([^\]]+)\]")
+_NUM_RE  = re.compile(r"\[([^\]]+)\]")
+_PHONE_RE = re.compile(r"^\+\d{7,15}$")   # E.164 strict
+
+def _is_phone(s: str) -> bool:
+    """Retourne True uniquement si s ressemble a un vrai numero E.164."""
+    return bool(_PHONE_RE.match(s.strip()))
 
 def fetch_sims():
     data = api_get(EP_DEVICES)
-    out = {}
+    out  = {}
+    skipped = []
     for dev in (data.get("data") or {}).get("devices", []):
         did = dev.get("id")
         for slot, label in (dev.get("sims") or {}).items():
             m = _NUM_RE.search(label)
-            if m and did:
-                out[m.group(1).strip()] = f"{did}|{slot}"
+            candidate = m.group(1).strip() if m else label.strip()
+            if did and _is_phone(candidate):
+                out[candidate] = f"{did}|{slot}"
+            else:
+                skipped.append(label)
+    if skipped:
+        print(f"[SIMS] Ignores (pas de numero valide): {skipped}", flush=True)
     return out
 
 # ─── SEND ───────────────────────────────────────────────────────────────────────
@@ -214,6 +224,11 @@ def rr_tick(state):
                 time.sleep(random.uniform(1.5, 3.0))
             except Exception as e:
                 print(f"  [ERR send] {sender}->{target}: {e}", flush=True)
+                # Marquer done pour ne pas reessayer en boucle
+                state.setdefault("pairs", {})[pk] = {
+                    "sender": sender, "target": target,
+                    "turn": 0, "status": "done", "err": str(e), "at": time.time()
+                }
                 skip += 1
         elif pair.get("status") == "done":
             skip += 1
