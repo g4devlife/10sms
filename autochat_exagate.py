@@ -245,16 +245,18 @@ def rr_tick(state):
 # ─── INBOUND ────────────────────────────────────────────────────────────────────
 def process(state, msg):
     """
-    Logique simplifiee basee sur deviceID+simSlot :
-      - from_n    = numero qui nous a envoye le message
-      - receiver  = notre SIM qui a recu (identifie via deviceID+simSlot)
-      - On repond DEPUIS receiver VERS from_n
-    Fonctionne quel que soit le sens de la conversation.
+    Logique de reponse robuste — ne depend PAS de deviceID/simSlot (souvent null).
+
+    Principe :
+      from_n  = celui qui a envoye le message (un de nos SIMs)
+      On cherche dans convs la paire active contenant from_n
+      L autre participant = celui qui repond
+
+    Exemple : A a envoye a B (conv A|B, turn=1)
+      B recoit → from_n=A → la paire active est A|B → le receiver est B → B repond a A
     """
     mid    = msg_id(msg)
     from_n = (msg.get("number") or "").strip()
-    dev_id = msg.get("deviceID")
-    slot   = msg.get("simSlot")
 
     if not mid or not from_n:
         return None
@@ -267,82 +269,73 @@ def process(state, msg):
 
     sims = state.get("sims", {})
 
-    # L expediteur doit etre un de nos SIMs (conversation inter-SIM uniquement)
+    # Ignorer les messages d expediteurs qui ne sont pas nos SIMs
     if from_n not in sims:
-        return None  # message externe, ignorer silencieusement
+        return None
 
-    # Identifier quel SIM a recu via deviceID+simSlot
-    receiver_spec = None
-    receiver_num  = None
-    if dev_id is not None and slot is not None:
-        spec_candidate = f"{dev_id}|{slot}"
-        for num, spec in sims.items():
-            if spec == spec_candidate:
-                receiver_spec = spec
-                receiver_num  = num
-                break
-
-    # Fallback si deviceID/simSlot absent : chercher via routing ou pairs
-    if not receiver_spec:
-        routing = state.get("routing", {})
-        sender_via_routing = routing.get(from_n)
-        if sender_via_routing and sender_via_routing in sims:
-            receiver_num  = sender_via_routing
-            receiver_spec = sims[sender_via_routing]
-
-    if not receiver_spec or not receiver_num:
-        return {"skip": "cant_identify_receiver", "from": from_n,
-                "deviceID": dev_id, "simSlot": slot}
-
-    # Cle de paire symetrique : toujours trie pour eviter duplicates
-    pk   = "|".join(sorted([from_n, receiver_num]))
+    # Chercher la conv active ou from_n est participant
     convs = state.setdefault("convs", {})
-    conv  = convs.get(pk)
+    matched_pk   = None
+    receiver_num = None
 
-    if conv is None:
-        # Nouvelle conversation non initiee par rr_tick (message entrant spontane)
-        conv = {"turn": 0, "status": "active"}
+    for pk, conv in convs.items():
+        if conv.get("status") != "active":
+            continue
+        parts = pk.split("|", 1)
+        if len(parts) != 2:
+            continue
+        a, b = parts
+        if from_n == a and b in sims:
+            matched_pk, receiver_num = pk, b
+            break
+        if from_n == b and a in sims:
+            matched_pk, receiver_num = pk, a
+            break
 
-    if conv.get("status") == "done":
-        return {"skip": "conv_done", "pk": pk}
+    if not matched_pk:
+        # Aucune conv active trouvee pour from_n
+        active_convs = {pk: c for pk, c in convs.items() if c.get("status") == "active"}
+        print(f"  [DEBUG process] SKIP no_active_conv from={from_n!r} active_convs={list(active_convs.keys())}", flush=True)
+        return {"skip": "no_active_conv", "from": from_n}
 
-    turn = int(conv.get("turn", 0))
+    receiver_spec = sims.get(receiver_num)
+    if not receiver_spec:
+        return {"skip": "no_spec", "receiver": receiver_num}
+
+    conv = convs[matched_pk]
+    turn = int(conv.get("turn", 1))
+
     if turn >= MAX_TURNS:
         conv["status"] = "done"
-        convs[pk] = conv
-        print(f"  [DONE] {pk} ({turn} tours)", flush=True)
-        return {"done": pk}
+        print(f"  [DONE] {matched_pk}", flush=True)
+        return {"done": matched_pk}
 
     if not can_send(state, receiver_spec):
-        return {"skip": "rate", "pk": pk}
+        return {"skip": "rate", "pk": matched_pk}
 
     next_turn = turn + 1
     reply     = tpl(next_turn)
 
-    # Delai humain avant reponse
     delay = random.randint(REPLY_DELAY_MIN_S, REPLY_DELAY_MAX_S)
-    print(f"  [WAIT {delay}s] {receiver_num} -> {from_n}", flush=True)
     time.sleep(delay)
 
     try:
         send_sms(receiver_spec, from_n, reply)
-        conv["turn"]   = next_turn
-        conv["at"]     = time.time()
+        conv["turn"] = next_turn
+        conv["at"]   = time.time()
         if next_turn >= MAX_TURNS:
             conv["status"] = "done"
-            print(f"  [DONE] {pk} ({next_turn} tours)", flush=True)
-        convs[pk] = conv
-        # Mettre a jour aussi la paire rr si elle existe
-        pairs = state.get("pairs", {})
+            print(f"  [DONE] {matched_pk} ({next_turn} tours)", flush=True)
+        # Sync paire rr
         for ppk in [f"{from_n}|{receiver_num}", f"{receiver_num}|{from_n}"]:
-            if ppk in pairs and pairs[ppk].get("status") == "active":
-                pairs[ppk]["turn"] = next_turn
+            if ppk in state.get("pairs", {}):
+                state["pairs"][ppk]["turn"] = next_turn
                 if next_turn >= MAX_TURNS:
-                    pairs[ppk]["status"] = "done"
-        return {"replied": pk, "turn": next_turn,
-                "from": from_n, "via": receiver_num}
+                    state["pairs"][ppk]["status"] = "done"
+        print(f"  [REPLY] {receiver_num} -> {from_n} turn={next_turn}: {reply[:40]}", flush=True)
+        return {"replied": matched_pk, "turn": next_turn}
     except Exception as e:
-        return {"err": str(e), "pk": pk}
+        return {"err": str(e), "pk": matched_pk}
 
 # ─── MAIN ───────────────────────────────────────────────────────────────────────
 def run():
@@ -410,11 +403,28 @@ def run():
             try:
                 msgs = sorted(fetch_received(),
                               key=lambda x: int(x.get("id") or x.get("ID") or 0))
-                results = [r for m in msgs if (r := process(state, m)) is not None]
+
+                # DEBUG : afficher tous les messages bruts non encore vus
+                seen_ids = state.get("seen", {})
+                new_msgs = [m for m in msgs if msg_id(m) not in seen_ids]
+                if new_msgs:
+                    print(f"[DEBUG] {len(new_msgs)} nouveaux msgs:", flush=True)
+                    for m in new_msgs:
+                        print(f"  msg brut: number={m.get('number')!r} deviceID={m.get('deviceID')!r} simSlot={m.get('simSlot')!r} id={m.get('id') or m.get('ID')!r} msg={str(m.get('message',''))[:40]!r}", flush=True)
+                    print(f"  sims connus: {sorted(state.get('sims',{}).keys())}", flush=True)
+                    print(f"  convs: {list(state.get('convs',{}).keys())}", flush=True)
+
+                results = []
+                for m in msgs:
+                    r = process(state, m)
+                    if r is not None:
+                        results.append(r)
                 if results:
                     print(f"[IN] {results}", flush=True)
             except Exception as e:
+                import traceback
                 print(f"[ERR inbound] {e}", flush=True)
+                traceback.print_exc()
 
             # Tick round-robin
             if now - last_tick >= RR_TICK_S:
