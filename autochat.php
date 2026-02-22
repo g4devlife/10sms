@@ -280,8 +280,8 @@ function run(): void {
         save_state($state);
 
         if ($state['rr_idx'] === 0) {
-            log_("\n[RR] Cycle complet ! Pause " . RR_PAUSE_S . "s avant nouveau cycle\n");
-            sleep(RR_PAUSE_S);
+            log_("\n[RR] Cycle complet ! Toutes les conversations terminees. Arret.\n");
+            exit(0);
         } else {
             log_("[RR] Passage au SIM suivant: " . $nums[$state['rr_idx']]);
             sleep(2);
