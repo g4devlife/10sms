@@ -13,6 +13,27 @@
  *   Puis SIM suivant fait pareil avec tous, etc.
  */
 
+// ─── SERVEUR HTTP MINIMAL (pour Render Web Service) ──────────────────────────
+// Ouvre le port attendu par Render dans un processus fils
+if (function_exists('pcntl_fork')) {
+    $pid = pcntl_fork();
+    if ($pid === 0) {
+        $port = getenv('PORT') ?: 10000;
+        $sock = @stream_socket_server("tcp://0.0.0.0:{$port}", $errno, $errstr);
+        if ($sock) {
+            while (true) {
+                $conn = @stream_socket_accept($sock, 5);
+                if ($conn) {
+                    fwrite($conn, "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\n\r\nOK");
+                    fclose($conn);
+                }
+            }
+        }
+        exit(0);
+    }
+    // Parent continue normalement
+}
+
 define('BASE_URL',          rtrim(getenv('SMS_GATEWAY_URL')   ?: 'https://gate.exanewtech.com', '/'));
 define('API_KEY',           getenv('SMS_GATEWAY_API_KEY')     ?: '');
 define('STATE_FILE',        getenv('STATE_FILE')              ?: __DIR__ . '/state.json');
