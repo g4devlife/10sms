@@ -16,12 +16,12 @@
 define('BASE_URL',          rtrim(getenv('SMS_GATEWAY_URL')   ?: 'https://gate.exanewtech.com', '/'));
 define('API_KEY',           getenv('SMS_GATEWAY_API_KEY')     ?: '');
 define('STATE_FILE',        getenv('STATE_FILE')              ?: __DIR__ . '/state.json');
-define('MAX_TURNS',         (int)(getenv('MAX_TURNS')         ?: 20)); // 20 = 10 msgs par tel
-define('REPLY_DELAY_MIN_S', (int)(getenv('REPLY_DELAY_MIN_S') ?: 20));
-define('REPLY_DELAY_MAX_S', (int)(getenv('REPLY_DELAY_MAX_S') ?: 40));
-define('PAIR_DELAY_MIN_S',  (int)(getenv('PAIR_DELAY_MIN_S')  ?: 5));
-define('PAIR_DELAY_MAX_S',  (int)(getenv('PAIR_DELAY_MAX_S')  ?: 10));
-define('RR_PAUSE_S',        (int)(getenv('RR_PAUSE_S')        ?: 60));
+define('MAX_TURNS',         (int)(getenv('MAX_TURNS')         ?: 20));
+define('REPLY_DELAY_MIN_S', (int)(getenv('REPLY_DELAY_MIN_S') ?: 1));
+define('REPLY_DELAY_MAX_S', (int)(getenv('REPLY_DELAY_MAX_S') ?: 2));
+define('PAIR_DELAY_MIN_S',  (int)(getenv('PAIR_DELAY_MIN_S')  ?: 1));
+define('PAIR_DELAY_MAX_S',  (int)(getenv('PAIR_DELAY_MAX_S')  ?: 2));
+define('RR_PAUSE_S',        (int)(getenv('RR_PAUSE_S')        ?: 30));
 
 // 20 templates = 10 messages par telephone (tour impair = A, tour pair = B)
 const TEMPLATES = [
@@ -227,24 +227,31 @@ function run(): void {
         $sender = $nums[$rr_idx];
         $targets = array_values(array_filter($nums, fn($n) => $n !== $sender));
 
-        log_("[RR] Emetteur: $sender (idx=$rr_idx) -> " . count($targets) . " targets");
+        log_("[RR] Emetteur: $sender (idx=$rr_idx) -> " . count($targets) . " targets (SIMULTANE)");
 
-        // Executer une conversation complete avec chaque target
+        // Lancer toutes les paires en PARALLELE avec pcntl_fork
+        $pids = [];
         foreach ($targets as $target) {
-            $arr = [$sender, $target];
-            sort($arr);
-            $pair_key = implode('|', $arr);
+            $pid = pcntl_fork();
+            if ($pid === -1) {
+                // Fork impossible, fallback sequentiel
+                log_("[WARN] fork failed, sequentiel pour $target");
+                run_conversation($sims, $sender, $target);
+            } elseif ($pid === 0) {
+                // Processus fils : executer la conversation puis quitter
+                run_conversation($sims, $sender, $target);
+                exit(0);
+            } else {
+                // Processus parent : enregistrer le PID fils
+                $pids[$pid] = $target;
+                log_("[FORK] PID $pid lance pour $sender <-> $target");
+            }
+        }
 
-            log_("[RR] Paire: $sender <-> $target");
-
-            run_conversation($sims, $sender, $target);
-
-            // Petit delai entre chaque paire
-            $d = random_int(PAIR_DELAY_MIN_S, PAIR_DELAY_MAX_S);
-            log_("[PAUSE entre paires: {$d}s]");
-            sleep($d);
-
-            save_state($state);
+        // Attendre que tous les fils terminent
+        foreach ($pids as $pid => $target) {
+            pcntl_waitpid($pid, $status);
+            log_("[DONE] PID $pid ($sender <-> $target) termine");
         }
 
         // Passer au SIM suivant
@@ -256,7 +263,7 @@ function run(): void {
             sleep(RR_PAUSE_S);
         } else {
             log_("[RR] Passage au SIM suivant: " . $nums[$state['rr_idx']]);
-            sleep(5);
+            sleep(2);
         }
     }
 }
