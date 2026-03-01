@@ -1,20 +1,15 @@
 <?php
 /**
- * AutoChat ExaGate — Round-Robin Full Auto
- * =========================================
- * Pas de polling inbound. La conversation complete (10 tours)
- * s'execute automatiquement avec delais humains.
+ * AutoChat ExaGate — Toutes paires SIMULTANÉES
+ * =============================================
+ * Toutes les combinaisons A<->B sont lancées en même temps
+ * via pcntl_fork. Pas de round-robin séquentiel.
  *
- * Logique :
- *   SIM A envoie a SIM B  tour 1 : "Hello !"
- *   SIM B repond a SIM A  tour 2 : "Ca va ?"
- *   SIM A repond a SIM B  tour 3 : "Tu fais quoi ?"
- *   ...jusqu'a MAX_TURNS
- *   Puis SIM suivant fait pareil avec tous, etc.
+ * Ex. avec 4 SIMs (A,B,C,D) : 6 conversations en parallèle
+ *   A<->B  A<->C  A<->D  B<->C  B<->D  C<->D
  */
 
 // ─── SERVEUR HTTP MINIMAL (pour Render Web Service) ──────────────────────────
-// Ouvre le port attendu par Render dans un processus fils
 if (function_exists('pcntl_fork')) {
     $pid = pcntl_fork();
     if ($pid === 0) {
@@ -31,20 +26,14 @@ if (function_exists('pcntl_fork')) {
         }
         exit(0);
     }
-    // Parent continue normalement
 }
 
 define('BASE_URL',          rtrim(getenv('SMS_GATEWAY_URL')   ?: 'https://gate.exanewtech.com', '/'));
 define('API_KEY',           getenv('SMS_GATEWAY_API_KEY')     ?: '');
-define('STATE_FILE',        getenv('STATE_FILE')              ?: __DIR__ . '/state.json');
 define('MAX_TURNS',         (int)(getenv('MAX_TURNS')         ?: 20));
 define('REPLY_DELAY_MIN_S', (int)(getenv('REPLY_DELAY_MIN_S') ?: 1));
 define('REPLY_DELAY_MAX_S', (int)(getenv('REPLY_DELAY_MAX_S') ?: 2));
-define('PAIR_DELAY_MIN_S',  (int)(getenv('PAIR_DELAY_MIN_S')  ?: 1));
-define('PAIR_DELAY_MAX_S',  (int)(getenv('PAIR_DELAY_MAX_S')  ?: 2));
-define('RR_PAUSE_S',        (int)(getenv('RR_PAUSE_S')        ?: 30));
 
-// 20 templates = 10 messages par telephone (tour impair = A, tour pair = B)
 const TEMPLATES = [
     1  => "Hello !",
     2  => "Ca va de ton cote ?",
@@ -140,18 +129,7 @@ function send_sms(string $spec, string $to, string $msg): void {
     log_("  >> $spec -> $to : $msg");
 }
 
-// ─── STATE ────────────────────────────────────────────────────────────────────
-function load_state(): array {
-    if (!file_exists(STATE_FILE)) return ['rr_idx' => 0, 'done_pairs' => []];
-    return json_decode(file_get_contents(STATE_FILE), true) ?: ['rr_idx' => 0, 'done_pairs' => []];
-}
-
-function save_state(array $s): void {
-    $tmp = STATE_FILE . '.tmp';
-    file_put_contents($tmp, json_encode($s, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE));
-    rename($tmp, STATE_FILE);
-}
-
+// ─── UTILS ───────────────────────────────────────────────────────────────────
 function log_(string $msg): void {
     echo '[' . date('H:i:s') . '] ' . $msg . PHP_EOL;
 }
@@ -169,27 +147,18 @@ function run_conversation(array $sims, string $numA, string $numB): void {
     log_("=== CONV $numA <-> $numB (" . MAX_TURNS . " tours) ===");
 
     for ($turn = 1; $turn <= MAX_TURNS; $turn++) {
-        // Tour impair : A envoie a B
-        // Tour pair   : B repond a A
         if ($turn % 2 === 1) {
-            $sender_spec = $specA;
-            $sender_num  = $numA;
-            $target_num  = $numB;
+            [$sender_spec, $sender_num, $target_num] = [$specA, $numA, $numB];
         } else {
-            $sender_spec = $specB;
-            $sender_num  = $numB;
-            $target_num  = $numA;
+            [$sender_spec, $sender_num, $target_num] = [$specB, $numB, $numA];
         }
 
-        $msg = tpl($turn);
-
         try {
-            send_sms($sender_spec, $target_num, $msg);
+            send_sms($sender_spec, $target_num, tpl($turn));
         } catch (Exception $e) {
             log_("  [ERR] tour $turn $sender_num->$target_num : " . $e->getMessage());
         }
 
-        // Delai entre chaque message (sauf apres le dernier)
         if ($turn < MAX_TURNS) {
             $delay = random_int(REPLY_DELAY_MIN_S, REPLY_DELAY_MAX_S);
             log_("  [attente {$delay}s avant tour " . ($turn + 1) . "]");
@@ -200,15 +169,26 @@ function run_conversation(array $sims, string $numA, string $numB): void {
     log_("=== FIN CONV $numA <-> $numB ===");
 }
 
+// ─── GÉNÈRE TOUTES LES COMBINAISONS DE PAIRES ────────────────────────────────
+function all_pairs(array $nums): array {
+    $pairs = [];
+    $n = count($nums);
+    for ($i = 0; $i < $n; $i++) {
+        for ($j = $i + 1; $j < $n; $j++) {
+            $pairs[] = [$nums[$i], $nums[$j]];
+        }
+    }
+    return $pairs;
+}
+
 // ─── MAIN ─────────────────────────────────────────────────────────────────────
 function run(): void {
     if (!API_KEY) { fwrite(STDERR, "SMS_GATEWAY_API_KEY manquant\n"); exit(1); }
 
-    log_("AutoChat ExaGate PHP — Full Auto Round-Robin");
+    log_("AutoChat ExaGate PHP — Toutes paires SIMULTANÉES");
     log_("BASE_URL = " . BASE_URL);
     log_("MAX_TURNS=" . MAX_TURNS . " REPLY_DELAY=" . REPLY_DELAY_MIN_S . "-" . REPLY_DELAY_MAX_S . "s");
 
-    // Test connexion
     try {
         http_get('/services/get-devices.php');
         log_("[INIT] connexion OK");
@@ -216,14 +196,11 @@ function run(): void {
         fwrite(STDERR, "Connexion impossible: " . $e->getMessage() . "\n"); exit(1);
     }
 
-    $state = (getenv('RESET_STATE') === '1') ? ['rr_idx' => 0, 'done_pairs' => []] : load_state();
-    if (getenv('RESET_STATE') === '1') log_("[INIT] RESET_STATE=1 — etat vierge");
-
     log_("Demarrage dans 3s...\n");
     sleep(3);
 
     while (true) {
-        // Recuperer SIMs frais
+        // Récupérer les SIMs
         try {
             $sims = fetch_sims();
         } catch (Exception $e) {
@@ -238,53 +215,48 @@ function run(): void {
             continue;
         }
 
-        $nums = array_keys($sims);
+        $nums  = array_keys($sims);
         sort($nums);
+        $pairs = all_pairs($nums);
 
         log_("[SIMS] " . count($nums) . ": " . implode(', ', $nums));
+        log_("[PAIRS] " . count($pairs) . " conversations a lancer en parallele");
 
-        // Index round-robin : le SIM emetteur du cycle
-        $rr_idx = $state['rr_idx'] % count($nums);
-        $sender = $nums[$rr_idx];
-        $targets = array_values(array_filter($nums, fn($n) => $n !== $sender));
-
-        log_("[RR] Emetteur: $sender (idx=$rr_idx) -> " . count($targets) . " targets (SIMULTANE)");
-
-        // Lancer toutes les paires en PARALLELE avec pcntl_fork
+        // ── Fork une conversation par paire ──────────────────────────────────
         $pids = [];
-        foreach ($targets as $target) {
+        foreach ($pairs as [$numA, $numB]) {
             $pid = pcntl_fork();
             if ($pid === -1) {
-                // Fork impossible, fallback sequentiel
-                log_("[WARN] fork failed, sequentiel pour $target");
-                run_conversation($sims, $sender, $target);
+                // Pas de fork disponible → fallback séquentiel
+                log_("[WARN] fork impossible, sequentiel pour $numA <-> $numB");
+                run_conversation($sims, $numA, $numB);
             } elseif ($pid === 0) {
-                // Processus fils : executer la conversation puis quitter
-                run_conversation($sims, $sender, $target);
+                // Fils : exécuter la conversation et quitter
+                run_conversation($sims, $numA, $numB);
                 exit(0);
             } else {
-                // Processus parent : enregistrer le PID fils
-                $pids[$pid] = $target;
-                log_("[FORK] PID $pid lance pour $sender <-> $target");
+                // Parent : enregistrer le PID
+                $pids[$pid] = "$numA <-> $numB";
+                log_("[FORK] PID $pid → $numA <-> $numB");
             }
         }
 
-        // Attendre que tous les fils terminent
-        foreach ($pids as $pid => $target) {
+        // ── Attendre la fin de tous les fils ─────────────────────────────────
+        foreach ($pids as $pid => $label) {
             pcntl_waitpid($pid, $status);
-            log_("[DONE] PID $pid ($sender <-> $target) termine");
+            log_("[DONE] PID $pid ($label) terminé");
         }
 
-        // Passer au SIM suivant
-        $state['rr_idx'] = ($rr_idx + 1) % count($nums);
-        save_state($state);
+        log_("\n[CYCLE] Toutes les conversations terminées.");
 
-        if ($state['rr_idx'] === 0) {
-            log_("\n[RR] Cycle complet ! Toutes les conversations terminees. Arret.\n");
-            exit(0);
+        // Relancer un nouveau cycle ou s'arrêter selon besoin
+        $pause = (int)(getenv('CYCLE_PAUSE_S') ?: 60);
+        if ($pause > 0) {
+            log_("[PAUSE] Prochain cycle dans {$pause}s...\n");
+            sleep($pause);
         } else {
-            log_("[RR] Passage au SIM suivant: " . $nums[$state['rr_idx']]);
-            sleep(2);
+            log_("[FIN] CYCLE_PAUSE_S=0, arrêt.");
+            exit(0);
         }
     }
 }
